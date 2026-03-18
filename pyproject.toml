@@ -1,0 +1,32 @@
+[tool.poetry]
+name = "business-template"
+version = "0.1.0"
+description = "Python SaaS starter template for business applications with API, auth, and modular architecture."
+authors = ["Your Name <you@example.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [{ include = "business_template", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.112.0"
+uvicorn = {extras = ["standard"], version = "^0.23.0"}
+SQLAlchemy = "^2.0"
+aiosqlite = "^0.18"
+psycopg2-binary = "^2.9"  # Optional: switch to your DB driver
+python-dotenv = "^1.0"
+pydantic-settings = "^2.13"
+email-validator = "^2.0"
+python-multipart = "^0.0.9"
+passlib = {extras = ["bcrypt"], version = "^1.7"}
+python-jose = {extras = ["cryptography"], version = "^3.3"}
+httpx = "^0.27"
+
+[tool.poetry.dev-dependencies]
+pytest = "^7.0"
+pytest-asyncio = "^0.21"
+httpx = "^0.27"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
