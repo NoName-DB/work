@@ -131,8 +131,16 @@ def show_next_steps():
 
 ⚙️  НАСТРОЙКА:
 
-• Бот использует реальный поиск eBay
+• Бот использует реальный поиск eBay через официальный API
 • Убедитесь, что TELEGRAM_BOT_TOKEN задан в `.env`
+• Для поиска eBay настройте EBAY_APP_ID в `.env` (опционально)
+
+🔌 EBAY API (РЕКОМЕНДУЕТСЯ):
+
+• Зарегистрируйтесь: https://developer.ebay.com/
+• Получите App ID и добавьте в .env:
+  EBAY_APP_ID=YOUR_APP_ID_HERE
+• Без App ID поиск eBay будет недоступен
 
 💡 СОВЕТ:
    Вы можете протестировать бота в Telegram:

@@ -147,9 +147,9 @@ def test_products_sorting():
 
 async def test_search_ebay_invalid_query():
     """Тест поиска eBay с невалидным запросом"""
-    from search import search_ebay
+    from search import search_ebay_api
 
-    results = await search_ebay("")
+    results = await search_ebay_api("")
     assert isinstance(results, list)
     assert len(results) == 0
 
@@ -161,14 +161,36 @@ async def test_search_products_invalid_query():
     from search import search_products
 
     # Слишком короткий запрос
-    products = await search_products("x")
+    products = await search_products("x", "LT")
     assert len(products) == 0
 
     # Пустой запрос
-    products = await search_products("")
+    products = await search_products("", "LT")
     assert len(products) == 0
 
     print("✅ test_search_products_invalid_query - пройден")
+
+
+async def test_ebay_api_no_app_id():
+    """Тест eBay API без настроенного App ID"""
+    from search import search_ebay_api
+
+    # Сохраняем оригинальный App ID
+    import config
+    original_app_id = config.EBAY_APP_ID
+
+    try:
+        # Устанавливаем невалидный App ID
+        config.EBAY_APP_ID = "YOUR_EBAY_APP_ID_HERE"
+
+        results = await search_ebay_api("test")
+        assert isinstance(results, list)
+        assert len(results) == 0  # Должен вернуть пустой список без App ID
+
+        print("✅ test_ebay_api_no_app_id - пройден")
+    finally:
+        # Восстанавливаем оригинальный App ID
+        config.EBAY_APP_ID = original_app_id
 
 
 def run_all_tests():
@@ -199,6 +221,7 @@ def run_all_tests():
     # Асинхронные тесты
     asyncio.run(test_search_ebay_invalid_query())
     asyncio.run(test_search_products_invalid_query())
+    asyncio.run(test_ebay_api_no_app_id())
     
     print()
     print("=" * 50)

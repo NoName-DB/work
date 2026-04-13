@@ -21,7 +21,7 @@ async def test_search(query: str):
     print(f"🔍 Поиск: {query}")
     print('='*60)
     
-    products = await search_products(query)
+    products = await search_products(query, "LT")
     
     if not products:
         print("❌ Товары не найдены")
@@ -77,7 +77,7 @@ async def search_test():
         print(f"\n📦 Тестирование: {description}")
         print(f"   Запрос: '{query}'")
         
-        products = await search_products(query)
+        products = await search_products(query, "LT")
         
         if products:
             print(f"   ✅ Найдено {len(products)} товаров")
