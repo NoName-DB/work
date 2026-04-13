@@ -5,6 +5,7 @@ import logging
 import re
 import asyncio
 import aiohttp
+import cloudscraper
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
@@ -78,10 +79,226 @@ class Product:
         }
 
 
+def _is_valid_pigu_url(url: str) -> bool:
+    """Проверить, является ли ссылка на Pigu реальным товаром."""
+    if not url:
+        return False
+
+    url_lower = url.lower()
+    return (
+        "id=" in url_lower
+        and "/lt/" in url_lower
+        and "search" not in url_lower
+        and "sq?" not in url_lower
+    )
+
+
+def _normalize_pigu_url(url: str) -> str:
+    """Нормализовать относительный URL Pigu в абсолютный."""
+    url = url.strip()
+    if url.startswith("http"):
+        return url
+    if url.startswith("/"):
+        return f"https://pigu.lt{url}"
+    return f"https://pigu.lt/{url}"
+
+
+def _extract_price_from_text(text: str) -> tuple[Optional[float], str]:
+    """Извлечь цену и валюту из текста."""
+    if not text:
+        return None, "EUR"
+
+    text = text.replace("\xa0", " ").replace("\u202f", " ")
+    price_match = re.search(r"(\d+[\d\.,]*)", text)
+    if not price_match:
+        return None, "EUR"
+
+    price = _parse_price(price_match.group(1))
+    currency = _parse_currency(text)
+    return (price if price and price > 0 else None, currency)
+
+
+def _find_pigu_price(link_element) -> tuple[Optional[float], str]:
+    """Поиск цены в контексте ссылки на Pigu."""
+    candidates = [link_element, link_element.parent, link_element.parent.parent]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        text = candidate.get_text(" ", strip=True)
+        price, currency = _extract_price_from_text(text)
+        if price is not None:
+            return price, currency
+
+    next_elem = link_element.find_next(string=True)
+    if next_elem:
+        price, currency = _extract_price_from_text(next_elem)
+        if price is not None:
+            return price, currency
+
+    for sibling in link_element.find_next_siblings():
+        text = sibling.get_text(" ", strip=True)
+        price, currency = _extract_price_from_text(text)
+        if price is not None:
+            return price, currency
+
+    return None, "EUR"
+
+
+def _search_pigu_sync(query: str) -> List[Product]:
+    """Синхронный helper для поиска на Pigu через cloudscraper."""
+    search_query = quote_plus(query)
+    url = f"https://pigu.lt/lt/search?q={search_query}"
+    scraper = cloudscraper.create_scraper(browser={"custom": config.USER_AGENTS[0]})
+    response = scraper.get(url, timeout=config.SEARCH_TIMEOUT)
+    if response.status_code != 200:
+        logger.warning(f"Pigu request failed with status {response.status_code} for query: {query}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    links = soup.find_all("a", href=True)
+
+    products: List[Product] = []
+    seen_urls = set()
+    tokens = [token.lower() for token in re.findall(r"\w+", query)]
+
+    for link in links:
+        href = link.get("href", "").strip()
+        if not _is_valid_pigu_url(href):
+            continue
+
+        product_url = _normalize_pigu_url(href)
+        if product_url in seen_urls:
+            continue
+
+        title = link.get_text(" ", strip=True)
+        if not title or len(title) < 3:
+            continue
+
+        if tokens and not all(token in title.lower() for token in tokens):
+            continue
+
+        price, currency = _find_pigu_price(link)
+        if price is None:
+            # Если цена не найдена, добавляем товар с неизвестной ценой
+            price = 999999
+            currency = "EUR"
+
+        products.append(
+            Product(
+                name=title,
+                price=price,
+                currency=currency,
+                store="Pigu.lt",
+                url=product_url,
+            )
+        )
+        seen_urls.add(product_url)
+
+        if len(products) >= config.MAX_RESULTS:
+            break
+
+    logger.info(f"Found {len(products)} products on Pigu.lt for query: {query}")
+    return products
+
+
+async def search_pigu(query: str, session: Optional[aiohttp.ClientSession] = None) -> List[Product]:
+    """Поиск товаров на Pigu.lt с использованием cloudscraper."""
+    try:
+        return await asyncio.to_thread(_search_pigu_sync, query)
+    except Exception as e:
+        logger.error(f"Error searching Pigu.lt: {e}")
+        return []
+
+
+async def search_ebay_api(query: str) -> List[Dict[str, Any]]:
+    """Поиск товаров на eBay через официальный Finding API."""
+    if not query or not query.strip():
+        return []
+
+    if not config.EBAY_APP_ID or config.EBAY_APP_ID == "YOUR_EBAY_APP_ID_HERE":
+        logger.warning("eBay App ID not configured")
+        return []
+
+    params = {
+        "OPERATION-NAME": "findItemsByKeywords",
+        "SERVICE-VERSION": "1.0.0",
+        "SECURITY-APPNAME": config.EBAY_APP_ID,
+        "RESPONSE-DATA-FORMAT": "JSON",
+        "keywords": query,
+        "paginationInput.entriesPerPage": config.MAX_RESULTS,
+        "GLOBAL-ID": "EBAY-US",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(config.EBAY_API_URL, params=params, timeout=config.SEARCH_TIMEOUT) as response:
+                if response.status != 200:
+                    logger.warning(f"eBay API request failed with status {response.status}")
+                    return []
+
+                data = await response.json()
+
+        if not data:
+            return []
+
+        if "errorMessage" in data:
+            error = data["errorMessage"][0]["error"][0]
+            logger.error(f"eBay API error: {error.get('message', 'unknown')}")
+            return []
+
+        response_items = data.get("findItemsByKeywordsResponse", [])
+        if not response_items:
+            return []
+
+        search_results = response_items[0].get("searchResult", [])
+        if not search_results:
+            return []
+
+        items = search_results[0].get("item", [])
+        if not items:
+            return []
+
+        results: List[Dict[str, Any]] = []
+        for item in items:
+            try:
+                title = item.get("title", [""])[0]
+                selling_status = item.get("sellingStatus", [{}])[0]
+                current_price = selling_status.get("currentPrice", [{}])[0]
+                price = float(current_price.get("__value__", 0.0))
+                currency = current_price.get("@currencyId", "USD")
+                url = item.get("viewItemURL", [""])[0]
+
+                if not title or not url:
+                    continue
+
+                results.append(
+                    {
+                        "title": title,
+                        "price": price,
+                        "url": url,
+                        "source": "eBay",
+                        "currency": currency,
+                    }
+                )
+            except Exception as e:
+                logger.debug(f"Error parsing eBay API item: {e}")
+                continue
+
+        logger.info(f"Found {len(results)} products via eBay API for query: {query}")
+        return results
+
+    except asyncio.TimeoutError:
+        logger.warning(f"eBay API timeout for query: {query}")
+        return []
+    except Exception as e:
+        logger.error(f"Error searching eBay API: {e}")
+        return []
+
+
 async def search_amazon(query: str, session: aiohttp.ClientSession) -> List[Product]:
     """Поиск товаров на Amazon.eu"""
     try:
-        url = f"https://www.amazon.eu/s?k={query}"
+        url = f"https://www.amazon.eu/s?k={quote_plus(query)}"
         headers = {"User-Agent": config.USER_AGENTS[0]}
 
         async with session.get(url, headers=headers, timeout=config.SEARCH_TIMEOUT) as response:
@@ -287,7 +504,7 @@ def _extract_url_from_item(item) -> Optional[str]:
 def _parse_ebay_items(soup: BeautifulSoup, query: str) -> List[Dict[str, Any]]:
     """Основной парсинг: li.s-item"""
     items = soup.select("li.s-item")
-    print(f"[DEBUG] Method 1: Found {len(items)} items with li.s-item selector")
+    logger.debug(f"Method 1: Found {len(items)} items with li.s-item selector")
     
     results: List[Dict[str, Any]] = []
     
@@ -322,7 +539,7 @@ def _parse_ebay_items(soup: BeautifulSoup, query: str) -> List[Dict[str, Any]]:
 def _parse_ebay_items_alt1(soup: BeautifulSoup, query: str) -> List[Dict[str, Any]]:
     """Альтернативный парсинг: div.s-item__wrapper"""
     items = soup.select("div.s-item__wrapper")
-    print(f"[DEBUG] Method 2: Found {len(items)} items with div.s-item__wrapper selector")
+    logger.debug(f"Method 2: Found {len(items)} items with div.s-item__wrapper selector")
     
     results: List[Dict[str, Any]] = []
     
@@ -356,7 +573,7 @@ def _parse_ebay_items_alt1(soup: BeautifulSoup, query: str) -> List[Dict[str, An
 def _parse_ebay_items_alt2(soup: BeautifulSoup, query: str) -> List[Dict[str, Any]]:
     """Альтернативный парсинг: div.s-item"""
     items = soup.select("div.s-item")
-    print(f"[DEBUG] Method 3: Found {len(items)} items with div.s-item selector")
+    logger.debug(f"Method 3: Found {len(items)} items with div.s-item selector")
     
     results: List[Dict[str, Any]] = []
     
@@ -389,21 +606,20 @@ def _parse_ebay_items_alt2(soup: BeautifulSoup, query: str) -> List[Dict[str, An
 
 def _parse_ebay_fallback(soup: BeautifulSoup, query: str) -> List[Dict[str, Any]]:
     """
-    Простой fallback: если ничего не нашлось, просто возьми первые 3 ссылки.
+    Простой fallback: если ничего не нашлось, просто возьми первые ссылки.
     Главное - не вернуть пустой список.
     """
     # Ищем все ссылки в основной области контента
     main_content = soup.find("main") or soup
-    links = main_content.find_all("a", limit=10)
-    
-    print(f"[DEBUG] Method 4 (fallback): Found {len(links)} links")
+    links = main_content.find_all("a", limit=20)
+
+    logger.debug(f"Method 4 (fallback): Found {len(links)} links")
     
     results: List[Dict[str, Any]] = []
     
     for link in links:
-        if len(results) >= 3:  # Минимум 3 товара
+        if len(results) >= config.MAX_RESULTS:
             break
-        
         href = link.get("href", "").strip()
         text = link.text.strip()
         
@@ -431,7 +647,7 @@ def _parse_ebay_fallback(soup: BeautifulSoup, query: str) -> List[Dict[str, Any]
 async def search_aliexpress(query: str, session: aiohttp.ClientSession) -> List[Product]:
     """Поиск товаров на AliExpress"""
     try:
-        url = f"https://www.aliexpress.com/wholesale?SearchText={query}"
+        url = f"https://www.aliexpress.com/wholesale?SearchText={quote_plus(query)}"
         headers = {"User-Agent": config.USER_AGENTS[2]}
 
         async with session.get(url, headers=headers, timeout=config.SEARCH_TIMEOUT) as response:
@@ -457,9 +673,9 @@ async def search_aliexpress(query: str, session: aiohttp.ClientSession) -> List[
         return []
 
 
-async def search_products(query: str) -> List[Product]:
+async def search_products(query: str, locale: str = "LT") -> List[Product]:
     """
-    Поиск товаров на eBay.
+    Поиск товаров по нескольким источникам.
     Возвращает отсортированный список товаров по цене.
     """
     if not query or len(query.strip()) < 2:
@@ -468,13 +684,39 @@ async def search_products(query: str) -> List[Product]:
 
     logger.info(f"Starting search for query: {query}")
     all_products: List[Product] = []
+    seen_urls = set()
 
-    ebay_results = await search_ebay(query)
+    ebay_results = await search_ebay_api(query)
+    if not ebay_results:
+        ebay_results = await search_ebay(query)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            asyncio.create_task(search_pigu(query, session)),
+            asyncio.create_task(search_amazon(query, session)),
+            asyncio.create_task(search_aliexpress(query, session)),
+        ]
+        fetched = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for idx, result in enumerate(fetched):
+        if isinstance(result, Exception):
+            logger.error(f"Source {idx} raised an exception: {result}")
+            continue
+        for product in result:
+            try:
+                if not product.url or product.url in seen_urls:
+                    continue
+                if product.price is None or product.price <= 0:
+                    product.price = 999999
+                all_products.append(product)
+                seen_urls.add(product.url)
+            except Exception as e:
+                logger.debug(f"Error processing aggregated product: {e}")
+                continue
+
     for item in ebay_results:
         try:
-            # Цена может быть None, используем 999999 как большую цену для сортировки
             price = item["price"] if item["price"] is not None else 999999
-            
             product = Product(
                 name=item["title"],
                 price=price,
@@ -482,12 +724,17 @@ async def search_products(query: str) -> List[Product]:
                 store=item.get("source", "eBay"),
                 url=item["url"],
             )
-            all_products.append(product)
+            if product.url and product.url not in seen_urls:
+                all_products.append(product)
+                seen_urls.add(product.url)
         except Exception as e:
             logger.debug(f"Error converting eBay result to Product: {e}")
             continue
 
-    # Сортировка по цене (товары с ценой впереди, неизвестные - позади)
+    if not all_products:
+        logger.warning(f"No products found for query: {query}")
+        return []
+
     all_products.sort(key=lambda p: (p.price == 999999, p.price))
     top_products = all_products[: config.MAX_RESULTS]
 
