@@ -1,13 +1,14 @@
 """
 Модуль для поиска товаров в интернет-магазинах
 """
+import json
 import logging
 import re
 import asyncio
 import aiohttp
 import cloudscraper
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qsl, urlunparse
 from bs4 import BeautifulSoup
 import config
 
@@ -46,6 +47,33 @@ def _parse_currency(price_text: str) -> str:
     return "USD"
 
 
+ACCESSORY_TERMS = [
+    "case",
+    "cover",
+    "čehol",
+    "чехол",
+    "dėklas",
+    "deklas",
+    "deklai",
+    "korpus",
+    "apvalkal",
+    "protekt",
+    "stiklas",
+    "защитн",
+    "kauk",
+]
+
+PROMOTION_TERMS = [
+    "piguplus",
+    "perkant internetu",
+    "internetu",
+    "akcija",
+    "nuolaida",
+    "e.parduotuv",
+    "e-parduotuv",
+    "online",
+]
+
 class Product:
     """Класс для представления товара"""
 
@@ -57,6 +85,7 @@ class Product:
         store: str,
         url: str,
         image_url: Optional[str] = None,
+        promotion: Optional[str] = None,
     ):
         self.name = name
         self.price = price
@@ -64,6 +93,7 @@ class Product:
         self.store = store
         self.url = url
         self.image_url = image_url
+        self.promotion = promotion
 
     def __repr__(self):
         return f"Product(name={self.name}, price={self.price} {self.currency}, store={self.store})"
@@ -76,6 +106,7 @@ class Product:
             "store": self.store,
             "url": self.url,
             "image_url": self.image_url,
+            "promotion": self.promotion,
         }
 
 
@@ -94,28 +125,117 @@ def _is_valid_pigu_url(url: str) -> bool:
 
 
 def _normalize_pigu_url(url: str) -> str:
-    """Нормализовать относительный URL Pigu в абсолютный."""
+    """Нормализовать относительный URL Pigu в абсолютный и убрать лишние параметры."""
     url = url.strip()
-    if url.startswith("http"):
+    if not url:
         return url
-    if url.startswith("/"):
-        return f"https://pigu.lt{url}"
-    return f"https://pigu.lt/{url}"
+
+    if not url.startswith("http"):
+        if url.startswith("/"):
+            url = f"https://pigu.lt{url}"
+        else:
+            url = f"https://pigu.lt/{url}"
+
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if "id" in query:
+        query = {"id": query["id"]}
+    else:
+        query = {}
+
+    normalized = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "id=" + query["id"] if "id" in query else "", ""))
+    return normalized
 
 
 def _extract_price_from_text(text: str) -> tuple[Optional[float], str]:
-    """Извлечь цену и валюту из текста."""
+    """Извлечь цену и валюту из текста, отдавая приоритет евро."""
     if not text:
         return None, "EUR"
 
     text = text.replace("\xa0", " ").replace("\u202f", " ")
-    price_match = re.search(r"(\d+[\d\.,]*)", text)
-    if not price_match:
-        return None, "EUR"
+    lower_text = text.lower()
 
-    price = _parse_price(price_match.group(1))
-    currency = _parse_currency(text)
-    return (price if price and price > 0 else None, currency)
+    euro_pattern = re.compile(
+        r"(?:€|eur|euro)\s*([0-9]+[\.,]?[0-9]*)|([0-9]+[\.,]?[0-9]*)\s*(?:€|eur|euro)",
+        re.IGNORECASE,
+    )
+    match = euro_pattern.search(text)
+    if match:
+        price_text = match.group(1) or match.group(2)
+        price = _parse_price(price_text)
+        if price and price > 0:
+            return price, "EUR"
+
+    currency_symbol_pattern = re.compile(r"€\s*([0-9]+[\.,]?[0-9]*)|([0-9]+[\.,]?[0-9]*)\s*€")
+    match = currency_symbol_pattern.search(text)
+    if match:
+        price_text = match.group(1) or match.group(2)
+        price = _parse_price(price_text)
+        if price and price > 0:
+            return price, "EUR"
+
+    if "eur" in lower_text or "euro" in lower_text:
+        price_candidate = re.search(r"([0-9]+[\.,]?[0-9]*)", text)
+        if price_candidate:
+            price = _parse_price(price_candidate.group(1))
+            if price and price > 0:
+                return price, "EUR"
+
+    return None, "EUR"
+
+
+def _contains_accessory_term(text: str) -> bool:
+    return any(term in text for term in ACCESSORY_TERMS)
+
+
+def _extract_query_tokens(text: str) -> List[str]:
+    return [token for token in re.findall(r"\w+", text.lower()) if token]
+
+
+def _matches_query_semantics(title: str, query: str, url: Optional[str] = None) -> bool:
+    title_lower = title.lower()
+    url_lower = url.lower() if url else ""
+    query_lower = query.lower()
+    query_tokens = _extract_query_tokens(query)
+    accessory_query = _contains_accessory_term(query_lower)
+    title_accessory = _contains_accessory_term(title_lower)
+    url_accessory = _contains_accessory_term(url_lower)
+
+    if accessory_query:
+        if not title_accessory and not url_accessory:
+            return False
+        accessory_tokens = [token for token in query_tokens if _contains_accessory_term(token)]
+        non_accessory_tokens = [token for token in query_tokens if token not in accessory_tokens]
+        return all(token in title_lower for token in non_accessory_tokens)
+
+    if title_accessory or url_accessory:
+        return False
+
+    if not query_tokens:
+        return True
+
+    return all(token in title_lower for token in query_tokens)
+
+
+def _extract_promotion_text(context_text: str) -> Optional[str]:
+    """Извлечь текст акции/скидки из контекста Pigu."""
+    if not context_text:
+        return None
+
+    text = context_text.lower()
+    for term in ["piguplus", "perkant internetu", "internetu", "e.parduotuv", "e-parduotuv", "online"]:
+        if term in text:
+            if "piguplus" in term:
+                return "Цена с PiguPlus"
+            if "perkant internetu" in term or "internetu" in term or "e.parduotuv" in term or "e-parduotuv" in term or "online" in term:
+                return "Скидка за покупку онлайн"
+
+    discount_match = re.search(r"(nuolaid[ a-z]*|akcija)[^\d]*(\d+%?)", text)
+    if discount_match:
+        discount = discount_match.group(2)
+        return f"Скидка {discount}"
+
+    return None
 
 
 def _find_pigu_price(link_element) -> tuple[Optional[float], str]:
@@ -155,33 +275,70 @@ def _search_pigu_sync(query: str) -> List[Product]:
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
-    links = soup.find_all("a", href=True)
+    cards = soup.select("div.c-product-card")
 
     products: List[Product] = []
     seen_urls = set()
-    tokens = [token.lower() for token in re.findall(r"\w+", query)]
 
-    for link in links:
-        href = link.get("href", "").strip()
-        if not _is_valid_pigu_url(href):
+    for card in cards:
+        if len(products) >= config.MAX_RESULTS:
+            break
+
+        title = None
+        product_url = None
+        price = None
+        currency = "EUR"
+        promotion = None
+
+        widget_data = card.get("widget-data")
+        if widget_data:
+            try:
+                meta = json.loads(widget_data)
+                title = meta.get("title") or meta.get("meta", {}).get("title")
+                product_url = meta.get("url") or meta.get("meta", {}).get("url")
+                if not product_url and meta.get("meta", {}).get("id"):
+                    product_url = _normalize_pigu_url(f"/lt/{meta.get('meta', {}).get('id')}")
+                price = meta.get("meta", {}).get("sell_price") or meta.get("dataLayerItem", {}).get("price")
+                if price is not None:
+                    price = float(price)
+                if not promotion:
+                    promotion = _extract_promotion_text(card.get_text(" ", strip=True))
+            except Exception:
+                title = title or None
+
+        if not title:
+            title_elem = card.select_one(".c-product-card__title a")
+            title = title_elem.text.strip() if title_elem else None
+
+        if not product_url:
+            link_elem = card.select_one(".c-product-card__title a, .c-product-card__image-wrapper a")
+            if link_elem:
+                product_url = link_elem.get("href", "").strip()
+
+        if not title or not product_url:
             continue
 
-        product_url = _normalize_pigu_url(href)
-        if product_url in seen_urls:
+        product_url = _normalize_pigu_url(product_url)
+        if not _is_valid_pigu_url(product_url) or product_url in seen_urls:
             continue
 
-        title = link.get_text(" ", strip=True)
-        if not title or len(title) < 3:
+        if not _matches_query_semantics(title, query, product_url):
             continue
 
-        if tokens and not all(token in title.lower() for token in tokens):
-            continue
-
-        price, currency = _find_pigu_price(link)
         if price is None:
-            # Если цена не найдена, добавляем товар с неизвестной ценой
+            price_elem = card.select_one("span.c-price.h-price--medium.h-price--loyalty") or card.select_one("span.c-price.h-price--medium") or card.find("span", class_="c-price")
+            if price_elem:
+                price, currency = _extract_price_from_text(price_elem.get_text(" ", strip=True))
+
+        if price is None:
+            price, currency = _find_pigu_price(card)
+
+        if price is None:
             price = 999999
             currency = "EUR"
+
+        if not promotion:
+            promotion = _extract_promotion_text(card.get_text(" ", strip=True))
 
         products.append(
             Product(
@@ -190,12 +347,10 @@ def _search_pigu_sync(query: str) -> List[Product]:
                 currency=currency,
                 store="Pigu.lt",
                 url=product_url,
+                promotion=promotion,
             )
         )
         seen_urls.add(product_url)
-
-        if len(products) >= config.MAX_RESULTS:
-            break
 
     logger.info(f"Found {len(products)} products on Pigu.lt for query: {query}")
     return products
@@ -226,7 +381,7 @@ async def search_ebay_api(query: str) -> List[Dict[str, Any]]:
         "RESPONSE-DATA-FORMAT": "JSON",
         "keywords": query,
         "paginationInput.entriesPerPage": config.MAX_RESULTS,
-        "GLOBAL-ID": "EBAY-US",
+        "GLOBAL-ID": "EBAY-DE",
     }
 
     try:
@@ -262,10 +417,13 @@ async def search_ebay_api(query: str) -> List[Dict[str, Any]]:
         for item in items:
             try:
                 title = item.get("title", [""])[0]
+                if not _matches_query_semantics(title, query):
+                    continue
+
                 selling_status = item.get("sellingStatus", [{}])[0]
                 current_price = selling_status.get("currentPrice", [{}])[0]
                 price = float(current_price.get("__value__", 0.0))
-                currency = current_price.get("@currencyId", "USD")
+                currency = current_price.get("@currencyId", "EUR")
                 url = item.get("viewItemURL", [""])[0]
 
                 if not title or not url:
@@ -322,6 +480,9 @@ async def search_amazon(query: str, session: aiohttp.ClientSession) -> List[Prod
 
                     if name_elem and price_elem and url_elem:
                         name = name_elem.text.strip()
+                        if not _matches_query_semantics(name, query):
+                            continue
+
                         price_str = price_elem.text.strip().replace("€", "").replace(",", ".").strip()
                         try:
                             price = float(price_str.split()[0])
@@ -363,10 +524,11 @@ async def search_ebay(query: str) -> List[Dict[str, Any]]:
 
     search_query = quote_plus(query)
     
-    # Попробовать сначала .com, затем .co.uk
+    # Попробовать сначала европейские сайты, затем UK
     urls = [
+        f"https://www.ebay.de/sch/i.html?_nkw={search_query}",
+        f"https://www.ebay.co.uk/sch/i.html?_nkw={search_query}",
         f"https://www.ebay.com/sch/i.html?_nkw={search_query}",
-        f"https://www.ebay.co.uk/sch/i.html?_nkw={search_query}"
     ]
     
     headers = {
@@ -521,6 +683,8 @@ def _parse_ebay_items(soup: BeautifulSoup, query: str) -> List[Dict[str, Any]]:
         
         if not product_url:
             continue
+        if not _matches_query_semantics(title, query):
+            continue
         
         # Теперь цена может быть None
         results.append(
@@ -549,6 +713,8 @@ def _parse_ebay_items_alt1(soup: BeautifulSoup, query: str) -> List[Dict[str, An
         
         title = _extract_title_from_item(item)
         if not title or title.lower() == "new listing":
+            continue
+        if not _matches_query_semantics(title, query):
             continue
         
         price, currency = _extract_price_from_item(item)
@@ -583,6 +749,8 @@ def _parse_ebay_items_alt2(soup: BeautifulSoup, query: str) -> List[Dict[str, An
         
         title = _extract_title_from_item(item)
         if not title or title.lower() == "new listing":
+            continue
+        if not _matches_query_semantics(title, query):
             continue
         
         price, currency = _extract_price_from_item(item)
@@ -675,60 +843,28 @@ async def search_aliexpress(query: str, session: aiohttp.ClientSession) -> List[
 
 async def search_products(query: str, locale: str = "LT") -> List[Product]:
     """
-    Поиск товаров по нескольким источникам.
+    Поиск товаров на Pigu.lt.
     Возвращает отсортированный список товаров по цене.
     """
     if not query or len(query.strip()) < 2:
         logger.warning(f"Invalid search query: {query}")
         return []
 
-    logger.info(f"Starting search for query: {query}")
+    logger.info(f"Starting Pigu.lt search for query: {query}")
     all_products: List[Product] = []
     seen_urls = set()
 
-    ebay_results = await search_ebay_api(query)
-    if not ebay_results:
-        ebay_results = await search_ebay(query)
-
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            asyncio.create_task(search_pigu(query, session)),
-            asyncio.create_task(search_amazon(query, session)),
-            asyncio.create_task(search_aliexpress(query, session)),
-        ]
-        fetched = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for idx, result in enumerate(fetched):
-        if isinstance(result, Exception):
-            logger.error(f"Source {idx} raised an exception: {result}")
-            continue
-        for product in result:
-            try:
-                if not product.url or product.url in seen_urls:
-                    continue
-                if product.price is None or product.price <= 0:
-                    product.price = 999999
-                all_products.append(product)
-                seen_urls.add(product.url)
-            except Exception as e:
-                logger.debug(f"Error processing aggregated product: {e}")
-                continue
-
-    for item in ebay_results:
+    pigu_results = await search_pigu(query)
+    for product in pigu_results:
         try:
-            price = item["price"] if item["price"] is not None else 999999
-            product = Product(
-                name=item["title"],
-                price=price,
-                currency=item.get("currency", "USD"),
-                store=item.get("source", "eBay"),
-                url=item["url"],
-            )
-            if product.url and product.url not in seen_urls:
-                all_products.append(product)
-                seen_urls.add(product.url)
+            if not product.url or product.url in seen_urls:
+                continue
+            if product.price is None or product.price <= 0:
+                product.price = 999999
+            all_products.append(product)
+            seen_urls.add(product.url)
         except Exception as e:
-            logger.debug(f"Error converting eBay result to Product: {e}")
+            logger.debug(f"Error processing Pigu product: {e}")
             continue
 
     if not all_products:
@@ -744,13 +880,15 @@ async def search_products(query: str, locale: str = "LT") -> List[Product]:
 
 def format_product_message(product: Product) -> str:
     """Форматирование товара для вывода в Telegram"""
-    price_text = f"{product.price} {product.currency}" if product.price != 999999 else "Цена не указана"
+    price_text = f"{product.price:.2f} {product.currency}" if product.price != 999999 else "Цена не указана"
+    promotion_text = f"\n🎯 {product.promotion}" if product.promotion else ""
     
     return (
         f"💰 <b>{product.name}</b>\n"
         f"💵 Цена: <b>{price_text}</b>\n"
         f"🏪 Магазин: {product.store}\n"
         f"🔗 <a href='{product.url}'>Перейти на товар</a>"
+        f"{promotion_text}"
     )
 
 
@@ -762,10 +900,14 @@ def format_search_results(products: List[Product]) -> str:
     message = "✅ <b>Найденные товары (отсортированы по цене):</b>\n\n"
 
     for i, product in enumerate(products, 1):
-        price_text = f"{product.price} {product.currency}" if product.price != 999999 else "Цена не указана"
+        price_text = f"{product.price:.2f} {product.currency}" if product.price != 999999 else "Цена не указана"
+        promotion_text = f"\n   🎯 {product.promotion}" if product.promotion else ""
         message += f"{i}. {product.name}\n"
         message += f"   💵 {price_text}\n"
         message += f"   🏪 {product.store}\n"
-        message += f"   <a href='{product.url}'>Ссылка</a>\n\n"
+        message += f"   <a href='{product.url}'>Ссылка</a>"
+        if promotion_text:
+            message += promotion_text
+        message += "\n\n"
 
     return message
