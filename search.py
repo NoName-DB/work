@@ -223,17 +223,46 @@ def _extract_promotion_text(context_text: str) -> Optional[str]:
         return None
 
     text = context_text.lower()
-    for term in ["piguplus", "perkant internetu", "internetu", "e.parduotuv", "e-parduotuv", "online"]:
-        if term in text:
-            if "piguplus" in term:
-                return "Цена с PiguPlus"
-            if "perkant internetu" in term or "internetu" in term or "e.parduotuv" in term or "e-parduotuv" in term or "online" in term:
-                return "Скидка за покупку онлайн"
+    condition_parts = []
+    if "piguplus" in text:
+        condition_parts.append("с PiguPlus")
 
-    discount_match = re.search(r"(nuolaid[ a-z]*|akcija)[^\d]*(\d+%?)", text)
-    if discount_match:
-        discount = discount_match.group(2)
-        return f"Скидка {discount}"
+    online_terms = ["perkant internetu", "tik internetu", "internetu", "e.parduotuv", "e-parduotuv", "online"]
+    if any(term in text for term in online_terms):
+        condition_parts.append("только онлайн")
+
+    percent_match = re.search(
+        r"(?:nuolaid[a-z]*|akcija|akcijos|sutaupyti|sutaupykite|sutaupa)[^\d%]*(\d{1,3})\s*%",
+        text,
+    )
+    if not percent_match:
+        percent_match = re.search(r"(\d{1,3})\s*%[\s\S]*?(?:nuolaid[a-z]*|akcija|akcijos|sutaupyti|sutaupykite|sutaupa)", text)
+
+    if percent_match:
+        discount = percent_match.group(1)
+        condition_text = f" ({', '.join(condition_parts)})" if condition_parts else ""
+        return f"Скидка {discount}%{condition_text}"
+
+    euro_match = re.search(
+        r"(?:sutaupyti|sutaupykite|sutaupote|sutaupa|nuolaid[a-z]*|akcija)[^\d€]*([0-9]+[\.,]?[0-9]*)\s*(?:€|eur|euro)",
+        text,
+    )
+    if not euro_match:
+        euro_match = re.search(
+            r"([0-9]+[\.,]?[0-9]*)\s*(?:€|eur|euro)[^\d]*(?:sutaupyti|sutaupykite|sutaupote|sutaupa|nuolaid[a-z]*|akcija)",
+            text,
+        )
+
+    if euro_match:
+        euro_amount = _parse_price(euro_match.group(1))
+        euro_text = f"{int(euro_amount) if euro_amount.is_integer() else f'{euro_amount:.2f}'} €"
+        condition_text = f" ({', '.join(condition_parts)})" if condition_parts else ""
+        return f"Скидка {euro_text}{condition_text}"
+
+    if condition_parts:
+        if "с PiguPlus" in condition_parts:
+            return "Цена с PiguPlus"
+        return "Скидка за покупку онлайн"
 
     return None
 

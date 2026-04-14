@@ -11,7 +11,7 @@ from pathlib import Path
 # Добавляем текущую папку в PATH для импорта модулей
 sys.path.insert(0, str(Path(__file__).parent))
 
-from search import Product, format_product_message, format_search_results
+from search import Product, format_product_message, format_search_results, _extract_promotion_text
 from examples import get_mock_products
 
 
@@ -67,6 +67,16 @@ def test_format_product_message():
     assert "Amazon" in message
     
     print("✅ test_format_product_message - пройден")
+
+
+def test_extract_promotion_text():
+    """Тест извлечения текста акции и условий"""
+    assert _extract_promotion_text("Nuolaida 20% perkant internetu") == "Скидка 20% (только онлайн)"
+    assert _extract_promotion_text("PiguPlus akcija 15%") == "Скидка 15% (с PiguPlus)"
+    assert _extract_promotion_text("Akcija sutaupykite 10 €") == "Скидка 10 €"
+    assert _extract_promotion_text("PiguPlus") == "Цена с PiguPlus"
+
+    print("✅ test_extract_promotion_text - пройден")
 
 
 def test_format_empty_results():
@@ -204,6 +214,7 @@ def run_all_tests():
     test_product_creation()
     test_product_dict_conversion()
     test_format_product_message()
+    test_extract_promotion_text()
     test_format_empty_results()
     test_format_multiple_results()
     test_mock_products_iphone()
