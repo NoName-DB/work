@@ -68,6 +68,24 @@ ACCESSORY_TERMS = [
     "kauk",
 ]
 
+GENERIC_SEARCH_TERMS = {
+    "shoes",
+    "shoe",
+    "sneakers",
+    "sneaker",
+    "boots",
+    "boot",
+    "sandals",
+    "sandale",
+    "slippers",
+    "footwear",
+    "batai",
+    "bateliai",
+    "keds",
+    "batel",
+    "kicks",
+}
+
 PROMOTION_TERMS = [
     "piguplus",
     "perkant internetu",
@@ -219,7 +237,17 @@ def _matches_query_semantics(title: str, query: str, url: Optional[str] = None) 
     if not query_tokens:
         return True
 
-    return all(token in title_lower for token in query_tokens)
+    meaningful_tokens = [token for token in query_tokens if token not in GENERIC_SEARCH_TERMS]
+    if meaningful_tokens:
+        return all(token in title_lower for token in meaningful_tokens)
+    return any(token in title_lower for token in query_tokens)
+
+
+def _is_non_discount_promotion(text: str) -> bool:
+    if not text:
+        return False
+    text_lower = text.lower()
+    return "moki3" in text_lower and "be pabrangimo" in text_lower
 
 
 def _extract_promotion_text(context_text: str) -> Optional[str]:
@@ -302,10 +330,13 @@ def _extract_pigu_card_promotion(card, widget_data: Optional[Dict[str, Any]] = N
     promo_label = card.select_one(".c-label--promotion, .c-flag--sale, .c-badge, .c-product-card__tag")
     if promo_label:
         label_text = promo_label.get_text(" ", strip=True)
-        if label_text:
+        if label_text and not _is_non_discount_promotion(label_text):
             return label_text
 
-    return _extract_promotion_text(card.get_text(" ", strip=True))
+    fallback_text = card.get_text(" ", strip=True)
+    if _is_non_discount_promotion(fallback_text):
+        return None
+    return _extract_promotion_text(fallback_text)
 
 
 def _find_pigu_price(link_element) -> tuple[Optional[float], str]:
@@ -547,12 +578,26 @@ async def search_sportland(query: str, session: Optional[aiohttp.ClientSession] 
     search_timeout = min(config.SEARCH_TIMEOUT, 3)
     url = "https://sportland.lt/graphql"
     graphql_query = """query SearchProducts($filter:ProductFilterInput,$pageSize:Int){ products(filter:$filter,pageSize:$pageSize){ items{ name url_key url_path price_range { minimum_price { final_price { value currency } regular_price { value currency } } } max_discount min_discount } } }"""
-    filter_payload = {
-        "or": {
-            "name": {"like": f"%{query}%"},
-            "sku": {"like": f"%{query}%"},
+    query_tokens = _extract_query_tokens(query)
+    if query_tokens:
+        filter_payload = {
+            "and": [
+                {
+                    "or": {
+                        "name": {"like": f"%{token}%"},
+                        "sku": {"like": f"%{token}%"},
+                    }
+                }
+                for token in query_tokens
+            ]
         }
-    }
+    else:
+        filter_payload = {
+            "or": {
+                "name": {"like": f"%{query}%"},
+                "sku": {"like": f"%{query}%"},
+            }
+        }
     json_payload = {"query": graphql_query, "variables": {"filter": filter_payload, "pageSize": config.MAX_RESULTS}}
     headers = {
         "User-Agent": config.USER_AGENTS[0],
@@ -1476,8 +1521,13 @@ async def search_products(query: str, locale: str = "LT") -> List[Product]:
         logger.warning(f"No products found for query: {query}")
         return []
 
-    # Sort by price (items without price go to the end)
-    all_products.sort(key=lambda p: (p.price == 999999, p.price))
+    def _promotion_rank(product: Product) -> int:
+        if product.promotion and product.price != 999999:
+            return 0
+        return 1
+
+    # Prioritize discounted/promotional products, then sort by price.
+    all_products.sort(key=lambda p: (p.price == 999999, _promotion_rank(p), p.price))
     top_products = all_products[: config.MAX_RESULTS]
 
     # Cache results
