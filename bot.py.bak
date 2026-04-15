@@ -11,6 +11,7 @@ import logging
 import json
 import os
 from datetime import datetime
+import aiohttp
 
 import config
 from search import search_products, format_search_results, Product, get_product_price
@@ -28,6 +29,7 @@ search_history: dict[int, deque[str]] = {}
 price_tracking: dict[str, dict] = {}  # user_id:product_id -> tracking info
 last_search_results: dict[int, List[Product]] = {}  # user_id -> last search results
 
+# Configuration files
 HISTORY_FILE = getattr(config, 'HISTORY_FILE', 'search_history.json')
 TRACKING_FILE = getattr(config, 'TRACKING_FILE', 'price_tracking.json')
 
@@ -108,9 +110,9 @@ def get_user_tracking(user_id: int) -> list:
     return [info for key, info in price_tracking.items() if info["user_id"] == user_id]
 
 
-def remove_price_tracking(user_id: int, product_id: str) -> bool:
+def remove_price_tracking(user_id: int, tracking_key: str) -> bool:
     """Удалить товар из отслеживания"""
-    key = f"{user_id}:{product_id}"
+    key = f"{user_id}:{tracking_key}"
     if key in price_tracking:
         del price_tracking[key]
         save_price_tracking()
@@ -122,6 +124,12 @@ def get_popular_keyboard() -> InlineKeyboardMarkup:
     buttons = [InlineKeyboardButton(text=query, callback_data=f"quick_search:{query}") for query in config.POPULAR_SEARCHES]
     keyboard_rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+
+
+def record_search_history(user_id: int, query: str) -> None:
+    history = search_history.setdefault(user_id, deque(maxlen=config.MAX_HISTORY))
+    if not history or history[-1].lower() != query.lower():
+        history.append(query)
 
 
 def format_history(user_id: int) -> str:
@@ -155,7 +163,6 @@ async def cmd_start(message: Message) -> None:
         "💡 <b>Доступные команды:</b>\n"
         "/help - справка\n"
         "/history - ваша история запросов\n"
-        "/track - отслеживаемые товары\n"
         "/start - начать заново\n\n"
         "Нажмите кнопку ниже, чтобы быстро начать поиск:",
         parse_mode="HTML",
@@ -170,10 +177,10 @@ async def cmd_help(message: Message) -> None:
 
     await message.answer(
         "🆘 <b>Справка</b>\n\n"
-        "Этот бот помогает найти самые дешёвые товары в интернет-магазинах.\n\n"
+        "Этот бот помогает найти самые дешёвые товары в литовских интернет-магазинах.\n\n"
         "📋 <b>Как работает бот:</b>\n"
         "• Вводите название товара на русском или литовском языке (2+ символа)\n"
-        "• Бот ищет товар на Pigu.lt, eBay, Amazon и других магазинах\n"
+        "• Бот ищет товар на Pigu.lt и других магазинах\n"
         "• Показывает топ-5 результатов, отсортированных по цене\n"
         "• Каждый результат содержит цену, название и ссылку\n\n"
         "🛍️ <b>Категории товаров:</b>\n"
@@ -186,7 +193,6 @@ async def cmd_help(message: Message) -> None:
         "⚡ <b>Быстрые команды:</b>\n"
         "/start - начать\n"
         "/history - ваша история поисков\n"
-        "/track - отслеживаемые товары\n"
         "/help - эта справка\n\n"
         "💬 Просто напишите название товара или выберите кнопку ниже!",
         parse_mode="HTML",
@@ -265,11 +271,14 @@ async def cmd_track(message: Message) -> None:
                 price_change = f" ({change_percent:+.1f}%)"
 
             response += f"{i}. {item['name']}\n"
-            response += f"   💰 {item['current_price']:.2f} {item['currency']}{price_change}\n"
+            response += f"   💰 {item['current_price']} {item['currency']}{price_change}\n"
             response += f"   🏪 {item['store']}\n"
             response += f"   🔗 <a href='{item['url']}'>Ссылка</a>\n\n"
 
         await message.answer(response, parse_mode="HTML")
+
+    
+    logger.info(f"User {user_id} started tracking product: {product_id}")
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("quick_search:"))
@@ -289,7 +298,6 @@ async def handle_quick_search(callback: CallbackQuery) -> None:
         result_message = format_search_results(products)
         await callback.message.delete()
         await callback.message.answer(result_message, parse_mode="HTML", disable_web_page_preview=False)
-        last_search_results[user_id] = products
         logger.info(f"User {user_id} received {len(products)} results from quick search")
     except Exception as e:
         logger.error(f"Error processing quick search request from user {user_id}: {e}")
@@ -331,7 +339,7 @@ async def handle_search(message: Message) -> None:
 
     try:
         # Ищем товары
-        products = await search_products(query, "LT")
+        products = await search_products(query, "LT")  # Литва
 
         # Форматируем результаты
         result_message = format_search_results(products)

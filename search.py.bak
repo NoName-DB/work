@@ -726,61 +726,58 @@ async def search_ebay_api(query: str) -> List[Dict[str, Any]]:
         return []
 
 
-async def search_amazon_products(query: str) -> List[Product]:
-    """Поиск товаров на Amazon.eu - возвращает Product объекты"""
+async def search_amazon(query: str, session: aiohttp.ClientSession) -> List[Product]:
+    """Поиск товаров на Amazon.eu"""
     try:
         url = f"https://www.amazon.eu/s?k={quote_plus(query)}"
         headers = {"User-Agent": config.USER_AGENTS[0]}
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=config.SEARCH_TIMEOUT) as response:
-                if response.status != 200:
-                    logger.warning(f"Amazon request failed with status {response.status}")
-                    return []
+        async with session.get(url, headers=headers, timeout=config.SEARCH_TIMEOUT) as response:
+            if response.status != 200:
+                logger.warning(f"Amazon request failed with status {response.status}")
+                return []
 
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
+            html = await response.text()
+            soup = BeautifulSoup(html, "html.parser")
 
-                products = []
-                items = soup.find_all(
-                    "div", {"data-component-type": "s-search-result"}
-                )[:config.MAX_RESULTS]
+            products = []
+            items = soup.find_all(
+                "div", {"data-component-type": "s-search-result"}
+            )[:config.MAX_RESULTS]
 
-                for item in items:
-                    try:
-                        name_elem = item.find("span", {"class": "a-size-base-plus"})
-                        price_elem = item.find("span", {"class": "a-price-whole"})
-                        url_elem = item.find("h2", {"class": "s-size-mini"})
-                        if url_elem:
-                            url_elem = url_elem.find("a")
+            for item in items:
+                try:
+                    name_elem = item.find("span", {"class": "a-size-base-plus"})
+                    price_elem = item.find("span", {"class": "a-price-whole"})
+                    url_elem = item.find("h2", {"class": "s-size-mini"}).find("a")
 
-                        if name_elem and price_elem and url_elem:
-                            name = name_elem.text.strip()
-                            if not _matches_query_semantics(name, query):
-                                continue
+                    if name_elem and price_elem and url_elem:
+                        name = name_elem.text.strip()
+                        if not _matches_query_semantics(name, query):
+                            continue
 
-                            price_str = price_elem.text.strip().replace("€", "").replace(",", ".").strip()
-                            try:
-                                price = float(price_str.split()[0])
-                            except (ValueError, IndexError):
-                                price = 999999
+                        price_str = price_elem.text.strip().replace("€", "").replace(",", ".").strip()
+                        try:
+                            price = float(price_str.split()[0])
+                        except (ValueError, IndexError):
+                            price = 0.0
 
-                            product_url = "https://www.amazon.eu" + url_elem.get("href", "")
+                        product_url = "https://www.amazon.eu" + url_elem.get("href", "")
 
-                            product = Product(
-                                name=name,
-                                price=price,
-                                currency="EUR",
-                                store="Amazon",
-                                url=product_url,
-                            )
-                            products.append(product)
-                    except Exception as e:
-                        logger.debug(f"Error parsing Amazon product: {e}")
-                        continue
+                        product = Product(
+                            name=name,
+                            price=price,
+                            currency="EUR",
+                            store="Amazon",
+                            url=product_url,
+                        )
+                        products.append(product)
+                except Exception as e:
+                    logger.debug(f"Error parsing Amazon product: {e}")
+                    continue
 
-                logger.info(f"Found {len(products)} products on Amazon for query: {query}")
-                return products
+            logger.info(f"Found {len(products)} products on Amazon for query: {query}")
+            return products
 
     except asyncio.TimeoutError:
         logger.warning(f"Amazon search timeout for query: {query}")
@@ -790,97 +787,9 @@ async def search_amazon_products(query: str) -> List[Product]:
         return []
 
 
-async def search_ebay_api_to_products(query: str) -> List[Product]:
-    """Поиск товаров на eBay через API - возвращает Product объекты"""
-    if not query or not query.strip():
-        return []
-
-    if not config.EBAY_APP_ID or config.EBAY_APP_ID == "YOUR_EBAY_APP_ID_HERE":
-        logger.warning("eBay App ID not configured")
-        return []
-
-    params = {
-        "OPERATION-NAME": "findItemsByKeywords",
-        "SERVICE-VERSION": "1.0.0",
-        "SECURITY-APPNAME": config.EBAY_APP_ID,
-        "RESPONSE-DATA-FORMAT": "JSON",
-        "keywords": query,
-        "paginationInput.entriesPerPage": config.MAX_RESULTS,
-        "GLOBAL-ID": "EBAY-DE",
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(config.EBAY_API_URL, params=params, timeout=config.SEARCH_TIMEOUT) as response:
-                if response.status != 200:
-                    logger.warning(f"eBay API request failed with status {response.status}")
-                    return []
-
-                data = await response.json()
-
-        if not data:
-            return []
-
-        if "errorMessage" in data:
-            error = data["errorMessage"][0]["error"][0]
-            logger.error(f"eBay API error: {error.get('message', 'unknown')}")
-            return []
-
-        response_items = data.get("findItemsByKeywordsResponse", [])
-        if not response_items:
-            return []
-
-        search_results = response_items[0].get("searchResult", [])
-        if not search_results:
-            return []
-
-        items = search_results[0].get("item", [])
-        if not items:
-            return []
-
-        results: List[Product] = []
-        for item in items:
-            try:
-                title = item.get("title", [""])[0]
-                if not _matches_query_semantics(title, query):
-                    continue
-
-                selling_status = item.get("sellingStatus", [{}])[0]
-                current_price = selling_status.get("currentPrice", [{}])[0]
-                price = float(current_price.get("__value__", 0.0))
-                currency = current_price.get("@currencyId", "EUR")
-                url = item.get("viewItemURL", [""])[0]
-
-                if not title or not url:
-                    continue
-
-                results.append(
-                    Product(
-                        name=title,
-                        price=price if price > 0 else 999999,
-                        currency=currency,
-                        store="eBay",
-                        url=url,
-                    )
-                )
-            except Exception as e:
-                logger.debug(f"Error parsing eBay API item: {e}")
-                continue
-
-        logger.info(f"Found {len(results)} products via eBay API for query: {query}")
-        return results
-
-    except asyncio.TimeoutError:
-        logger.warning(f"eBay API timeout for query: {query}")
-        return []
-    except Exception as e:
-        logger.error(f"Error searching eBay API: {e}")
-        return []
-
-
-async def search_ebay(query: str) -> List[Product]:
+async def search_ebay(query: str) -> List[Dict[str, Any]]:
     """
-    Поиск товаров на eBay. Возвращает список Product объектов.
+    Поиск товаров на eBay. Возвращает список словарей с результатами.
     Использует множественные fallback методы для гарантированного поиска.
     """
     if not query or not query.strip():
@@ -888,6 +797,7 @@ async def search_ebay(query: str) -> List[Product]:
 
     search_query = quote_plus(query)
     
+    # Попробовать сначала европейские сайты, затем UK
     urls = [
         f"https://www.ebay.de/sch/i.html?_nkw={search_query}",
         f"https://www.ebay.co.uk/sch/i.html?_nkw={search_query}",
@@ -916,38 +826,44 @@ async def search_ebay(query: str) -> List[Product]:
                     if response.status != 200:
                         logger.warning(f"eBay request failed with status {response.status} for {url}")
                         continue
+
                     html = await response.text()
 
+            # Проверка на блокировку
             if "Pardon Our Interruption" in html or "captcha" in html.lower():
                 logger.warning(f"eBay search page blocked or captcha for query: {query} on {url}")
                 continue
 
             soup = BeautifulSoup(html, "html.parser")
             
-            results = _parse_ebay_items_to_products(soup, query)
+            # МЕТОД 1: Основной селектор
+            results = _parse_ebay_items(soup, query)
             if results:
-                logger.info(f"Found {len(results)} products (method 1) on eBay for query: {query}")
+                logger.info(f"Found {len(results)} products (method 1: li.s-item) on eBay for query: {query}")
                 return results
             
+            # МЕТОД 2: Альтернативный селектор 1
             logger.debug(f"Method 1 failed, trying method 2...")
-            results = _parse_ebay_items_alt1_to_products(soup, query)
+            results = _parse_ebay_items_alt1(soup, query)
             if results:
-                logger.info(f"Found {len(results)} products (method 2) on eBay for query: {query}")
+                logger.info(f"Found {len(results)} products (method 2: div.s-item__wrapper) on eBay for query: {query}")
                 return results
             
+            # МЕТОД 3: Альтернативный селектор 2
             logger.debug(f"Method 2 failed, trying method 3...")
-            results = _parse_ebay_items_alt2_to_products(soup, query)
+            results = _parse_ebay_items_alt2(soup, query)
             if results:
-                logger.info(f"Found {len(results)} products (method 3) on eBay for query: {query}")
+                logger.info(f"Found {len(results)} products (method 3: div.s-item) on eBay for query: {query}")
                 return results
             
+            # МЕТОД 4: Простой fallback - сырые ссылки
             logger.debug(f"Method 3 failed, using raw fallback...")
-            results = _parse_ebay_fallback_to_products(soup, query)
+            results = _parse_ebay_fallback(soup, query)
             if results:
                 logger.warning(f"Found {len(results)} products using raw fallback for query: {query}")
                 return results
             
-            logger.warning(f"No results found on {url}")
+            logger.warning(f"No results found on {url}. HTML preview: {html[:500]}")
 
         except asyncio.TimeoutError:
             logger.warning(f"eBay search timeout for query: {query} on {url}")
@@ -956,7 +872,8 @@ async def search_ebay(query: str) -> List[Product]:
             logger.error(f"Error searching eBay on {url}: {e}")
             continue
 
-    logger.debug(f"No eBay results found for query: {query}")
+    # Если ничего не найдено ни на одном сайте
+    logger.error(f"No eBay results found for query: {query} on any site using any method")
     return []
 
 
@@ -1164,159 +1081,6 @@ def _parse_ebay_fallback(soup: BeautifulSoup, query: str) -> List[Dict[str, Any]
                 "currency": "USD",
             }
         )
-    
-    return results
-
-
-def _parse_ebay_items_to_products(soup: BeautifulSoup, query: str) -> List[Product]:
-    """Основной парсинг eBay: li.s-item -> Product объекты"""
-    items = soup.select("li.s-item")
-    logger.debug(f"Method 1: Found {len(items)} items with li.s-item selector")
-    
-    results: List[Product] = []
-    seen_urls = set()
-    
-    for item in items:
-        if len(results) >= config.MAX_RESULTS:
-            break
-        
-        title = _extract_title_from_item(item)
-        if not title or title.lower() == "new listing":
-            continue
-        
-        price, currency = _extract_price_from_item(item)
-        product_url = _extract_url_from_item(item)
-        
-        if not product_url or product_url in seen_urls:
-            continue
-        if not _matches_query_semantics(title, query):
-            continue
-        
-        results.append(
-            Product(
-                name=title,
-                price=price if price else 999999,
-                currency=currency if currency else "USD",
-                store="eBay",
-                url=product_url,
-            )
-        )
-        seen_urls.add(product_url)
-    
-    return results
-
-
-def _parse_ebay_items_alt1_to_products(soup: BeautifulSoup, query: str) -> List[Product]:
-    """Альтернативный парсинг eBay: div.s-item__wrapper -> Product объекты"""
-    items = soup.select("div.s-item__wrapper")
-    logger.debug(f"Method 2: Found {len(items)} items with div.s-item__wrapper selector")
-    
-    results: List[Product] = []
-    seen_urls = set()
-    
-    for item in items:
-        if len(results) >= config.MAX_RESULTS:
-            break
-        
-        title = _extract_title_from_item(item)
-        if not title or title.lower() == "new listing":
-            continue
-        if not _matches_query_semantics(title, query):
-            continue
-        
-        price, currency = _extract_price_from_item(item)
-        product_url = _extract_url_from_item(item)
-        
-        if not product_url or product_url in seen_urls:
-            continue
-        
-        results.append(
-            Product(
-                name=title,
-                price=price if price else 999999,
-                currency=currency if currency else "USD",
-                store="eBay",
-                url=product_url,
-            )
-        )
-        seen_urls.add(product_url)
-    
-    return results
-
-
-def _parse_ebay_items_alt2_to_products(soup: BeautifulSoup, query: str) -> List[Product]:
-    """Альтернативный парсинг eBay: div.s-item -> Product объекты"""
-    items = soup.select("div.s-item")
-    logger.debug(f"Method 3: Found {len(items)} items with div.s-item selector")
-    
-    results: List[Product] = []
-    seen_urls = set()
-    
-    for item in items:
-        if len(results) >= config.MAX_RESULTS:
-            break
-        
-        title = _extract_title_from_item(item)
-        if not title or title.lower() == "new listing":
-            continue
-        if not _matches_query_semantics(title, query):
-            continue
-        
-        price, currency = _extract_price_from_item(item)
-        product_url = _extract_url_from_item(item)
-        
-        if not product_url or product_url in seen_urls:
-            continue
-        
-        results.append(
-            Product(
-                name=title,
-                price=price if price else 999999,
-                currency=currency if currency else "USD",
-                store="eBay",
-                url=product_url,
-            )
-        )
-        seen_urls.add(product_url)
-    
-    return results
-
-
-def _parse_ebay_fallback_to_products(soup: BeautifulSoup, query: str) -> List[Product]:
-    """Fallback парсинг eBay - возвращает Product объекты"""
-    main_content = soup.find("main") or soup
-    links = main_content.find_all("a", limit=20)
-
-    logger.debug(f"Method 4 (fallback): Found {len(links)} links")
-    
-    results: List[Product] = []
-    seen_urls = set()
-    
-    for link in links:
-        if len(results) >= config.MAX_RESULTS:
-            break
-        href = link.get("href", "").strip()
-        text = link.text.strip()
-        
-        if not href or len(text) < 5 or not text or "http" not in href:
-            continue
-        
-        if "/itm/" not in href and "/itm-" not in href:
-            continue
-        
-        if href in seen_urls:
-            continue
-        
-        results.append(
-            Product(
-                name=text,
-                price=999999,
-                currency="USD",
-                store="eBay",
-                url=href,
-            )
-        )
-        seen_urls.add(href)
     
     return results
 

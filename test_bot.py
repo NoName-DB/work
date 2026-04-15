@@ -11,8 +11,18 @@ from pathlib import Path
 # Добавляем текущую папку в PATH для импорта модулей
 sys.path.insert(0, str(Path(__file__).parent))
 
-from search import Product, format_product_message, format_search_results, _extract_promotion_text
+from search import (
+    Product,
+    format_product_message,
+    format_search_results,
+    _build_sportland_url,
+    _calculate_sportland_discount,
+    _extract_promotion_text,
+    _extract_pigu_card_promotion,
+    _normalize_proteinas_url,
+)
 from examples import get_mock_products
+from bs4 import BeautifulSoup
 
 
 def test_product_creation():
@@ -65,18 +75,67 @@ def test_format_product_message():
     assert "699.99" in message
     assert "EUR" in message
     assert "Amazon" in message
+    assert "🎯" not in message
     
     print("✅ test_format_product_message - пройден")
 
 
+def test_format_product_message_with_promotion():
+    """Тест, что скидка выводится в одной строке с ценой"""
+    product = Product(
+        name="iPhone 15",
+        price=639.95,
+        currency="EUR",
+        store="Pigu.lt",
+        url="https://pigu.lt/lt/product",
+        promotion="скидка только для членов PiguPlus"
+    )
+
+    message = format_product_message(product)
+    assert "639.95 EUR (скидка только для членов PiguPlus)" in message
+    assert "🎯" not in message
+
+    print("✅ test_format_product_message_with_promotion - пройден")
+
+
 def test_extract_promotion_text():
     """Тест извлечения текста акции и условий"""
-    assert _extract_promotion_text("Nuolaida 20% perkant internetu") == "Скидка 20% (только онлайн)"
-    assert _extract_promotion_text("PiguPlus akcija 15%") == "Скидка 15% (с PiguPlus)"
-    assert _extract_promotion_text("Akcija sutaupykite 10 €") == "Скидка 10 €"
-    assert _extract_promotion_text("PiguPlus") == "Цена с PiguPlus"
+    assert _extract_promotion_text("Nuolaida 20% perkant internetu") == "скидка 20% (только онлайн)"
+    assert _extract_promotion_text("PiguPlus akcija 15%") == "скидка 15% (с PiguPlus)"
+    assert _extract_promotion_text("Akcija sutaupykite 10 €") == "скидка 10 €"
+    assert _extract_promotion_text("PiguPlus") == "скидка только для членов PiguPlus"
 
     print("✅ test_extract_promotion_text - пройден")
+
+
+def test_extract_pigu_card_promotion():
+    """Тест извлечения промо из карточки Pigu с PiguPlus-ценой"""
+    html = '''
+    <div class="c-product-card">
+      <span class="c-price h-price--medium h-price--loyalty">680<sup>00</sup><small>€</small></span>
+      <span class="c-price h-price--medium">799<sup>00</sup><small>€</small></span>
+    </div>
+    '''
+    card = BeautifulSoup(html, 'html.parser').select_one('.c-product-card')
+    widget_data = {
+        'dataLayerItem': {
+            'price': 680,
+            'regular_price': 799,
+        }
+    }
+    assert _extract_pigu_card_promotion(card, widget_data) == 'скидка только для членов PiguPlus'
+    assert _extract_pigu_card_promotion(card, None) == 'скидка только для членов PiguPlus'
+
+    print('✅ test_extract_pigu_card_promotion - пройден')
+
+
+def test_sportland_and_proteinas_helpers():
+    assert _calculate_sportland_discount(80, 100) == 'цена со скидкой 20%'
+    assert _calculate_sportland_discount(99.99, 100) is None
+    assert _build_sportland_url('nike_something', None) == 'https://sportland.lt/product/nike_something'
+    assert _normalize_proteinas_url('/lt/123.html') == 'https://proteinas.lt/lt/123.html'
+
+    print('✅ test_sportland_and_proteinas_helpers - пройден')
 
 
 def test_format_empty_results():
@@ -103,6 +162,18 @@ def test_format_multiple_results():
     assert "100.0" in message
     
     print("✅ test_format_multiple_results - пройден")
+
+
+def test_format_search_results_with_promotion():
+    """Тест списка товаров с inline-скидкой"""
+    products = [
+        Product("Product X", 639.95, "EUR", "Pigu.lt", "https://pigu.lt/x", promotion="скидка только при покупке онлайн"),
+    ]
+    message = format_search_results(products)
+    assert "639.95 EUR (скидка только при покупке онлайн)" in message
+    assert "🎯" not in message
+
+    print("✅ test_format_search_results_with_promotion - пройден")
 
 
 def test_mock_products_iphone():
